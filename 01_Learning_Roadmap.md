@@ -3,13 +3,6 @@ markmap:
   initialExpandLevel: 2
 ---
 
-# Tunix Learning Roadmap
-
-> **Format:** This file is in Markmap format - you can visualize it as an interactive mindmap!  
-> **How to use:** Copy this content to https://markmap.js.org/repl or use a Markmap VSCode extension
-
----
-
 # Tunix Learning Journey
 
 ## ✅ Phase 0: Setup & Overview
