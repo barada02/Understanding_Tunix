@@ -1,3 +1,8 @@
+---
+markmap:
+  initialExpandLevel: 2
+---
+
 # Tunix Learning Roadmap
 
 > **Format:** This file is in Markmap format - you can visualize it as an interactive mindmap!  

@@ -1,3 +1,8 @@
+---
+markmap:
+  initialExpandLevel: 2
+---
+
 # Tunix Repository Overview
 
 **Created:** December 27, 2025  
