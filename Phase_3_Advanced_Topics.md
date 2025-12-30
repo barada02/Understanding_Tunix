@@ -1871,4 +1871,692 @@ sampler = grain.IndexSampler(
 
 ## Usage Examples
 
+### Example 1: Single-Host Training with FSDP
+
+```python
+import jax
+import jax.sharding as shd
+from tunix.sft import peft_trainer, sharding_utils
+
+# Initialize mesh
+devices = jax.local_devices()  # 8 TPUs
+mesh = shd.Mesh(devices, ("fsdp",))
+
+# Configure trainer
+config = peft_trainer.PeftTrainerConfig(
+    data_sharding_axis=("fsdp",),
+    learning_rate=1e-4,
+    num_train_steps=1000,
+)
+
+# Create trainer
+with mesh:
+  trainer = peft_trainer.PeftTrainer(config)
+  
+  # Shard input data
+  for step, batch in enumerate(train_loader):
+    batch = sharding_utils.shard_input(batch, ("fsdp",))
+    
+    # Training step
+    loss = trainer.train_step(model, batch)
+    
+    if step % 100 == 0:
+      print(f"Step {step}, Loss: {loss}")
+```
+
+### Example 2: Multi-Host Training Setup
+
+```python
+import jax
+import jax.distributed
+
+# Initialize distributed JAX (on each host)
+jax.distributed.initialize(
+    coordinator_address="10.0.0.1:1234",
+    num_processes=4,
+    process_id=os.environ["JAX_PROCESS_ID"],  # 0-3
+)
+
+# Create global mesh across all hosts
+devices = jax.devices()  # 32 TPUs total
+mesh = jax.sharding.Mesh(
+    devices.reshape(16, 2),  # 16-way FSDP, 2-way TP
+    ("fsdp", "tp")
+)
+
+# Training loop
+with mesh:
+  for step, batch in enumerate(train_loader):
+    # Only main process logs
+    if jax.process_index() == 0 and step % 10 == 0:
+      print(f"Step {step}")
+    
+    # All processes train
+    loss = train_step(model, batch)
+    
+    # Save checkpoint (main process only)
+    if jax.process_index() == 0 and step % 100 == 0:
+      checkpoint_manager.save(step, model)
+    
+    # Wait for checkpoint to complete
+    jax.experimental.multihost_utils.sync_global_devices("checkpoint_done")
+```
+
+### Example 3: Checkpoint Management
+
+```python
+from tunix.sft import checkpoint_manager
+import orbax.checkpoint as ocp
+
+# Initialize checkpoint manager
+ckpt_options = ocp.CheckpointManagerOptions(
+    save_decision_policy=ocp.checkpoint_managers.ContinuousCheckpointingPolicy(
+        minimum_interval_secs=300,  # Save every 5 minutes
+    ),
+    max_to_keep=5,  # Keep 5 most recent checkpoints
+)
+
+ckpt_mgr = checkpoint_manager.CheckpointManager(
+    root_directory="/tmp/checkpoints",
+    options=ckpt_options,
+)
+
+# Restore from checkpoint
+restored_step, metadata = ckpt_mgr.maybe_restore(model)
+print(f"Restored from step {restored_step}")
+
+# Training loop
+for step in range(restored_step, num_steps):
+  loss = train_step(model, batch)
+  
+  # Save checkpoint (respects save_decision_policy)
+  saved = ckpt_mgr.save(
+      step=step,
+      model=model,
+      custom_metadata={"loss": float(loss)},
+  )
+  
+  if saved:
+    print(f"Saved checkpoint at step {step}")
+```
+
+### Example 4: Metrics Logging
+
+```python
+from tunix.sft import metrics_logger
+
+# Initialize logger
+logger = metrics_logger.MetricsLogger(
+    metrics_logger.MetricsLoggerOptions(
+        log_dir="/tmp/logs",
+        project_name="tunix_experiments",
+        run_name="gemma2_sft_run1",
+        flush_every_n_steps=50,
+    )
+)
+
+# Training loop
+for step in range(num_steps):
+  # Training
+  train_loss = train_step(model, train_batch)
+  logger.log(
+      metrics_prefix="training",
+      metric_name="loss",
+      scalar_value=float(train_loss),
+      mode=metrics_logger.Mode.TRAIN,
+      step=step,
+  )
+  
+  # Evaluation
+  if step % 100 == 0:
+    eval_loss = evaluate(model, eval_loader)
+    logger.log(
+        metrics_prefix="evaluation",
+        metric_name="loss",
+        scalar_value=float(eval_loss),
+        mode=metrics_logger.Mode.EVAL,
+        step=step,
+    )
+    
+    # Get average metrics
+    avg_train_loss = logger.get_metric("training", "loss", "train")
+    print(f"Step {step}, Avg Train Loss: {avg_train_loss:.4f}")
+```
+
+### Example 5: System Metrics Monitoring
+
+```python
+from tunix.sft import system_metrics_calculator, utils
+import time
+
+# Measure TFLOPs (one-time static analysis)
+tflops_per_step = system_metrics_calculator.measure_tflops_per_step(
+    train_step_fn=jax.jit(train_step),
+    model=model,
+    optimizer=optimizer,
+    train_example=sample_batch,
+)
+print(f"TFLOPs per step: {tflops_per_step:.2f}")
+
+# Training loop with performance tracking
+for step in range(num_steps):
+  # Track HBM before step
+  if step % 100 == 0:
+    utils.show_hbm_usage(f"Step {step} - Before")
+  
+  # Time the step
+  start_time = time.time()
+  loss = train_step(model, batch)
+  step_time = time.time() - start_time
+  
+  # Calculate TFLOPS/s
+  tflops_per_sec = system_metrics_calculator.approximate_tflops_per_second(
+      total_model_params=model_params_count,
+      global_batch_size=batch_size * jax.device_count(),
+      step_time_delta=step_time,
+  )
+  
+  print(f"Step {step}: {step_time:.3f}s, {tflops_per_sec:.2f} TFLOPS/s")
+  
+  # Track HBM after step
+  if step % 100 == 0:
+    utils.show_hbm_usage(f"Step {step} - After")
+```
+
+### Example 6: Profiling Training
+
+```python
+from tunix.sft import profiler
+
+# Configure profiler
+profiler_opts = profiler.ProfilerOptions(
+    log_dir="/tmp/profiles",
+    skip_first_n_steps=10,    # Skip warmup steps
+    profiler_steps=5,         # Profile 5 steps
+    host_tracer_level=2,      # Capture HBM
+    python_tracer_level=1,    # Capture Python calls
+)
+
+prof = profiler.Profiler(
+    initial_step=0,
+    max_step=1000,
+    profiler_options=profiler_opts,
+)
+
+# Training loop
+for step in range(1000):
+  prof.maybe_activate(step)    # Activates at step 10
+  
+  loss = train_step(model, batch)
+  
+  prof.maybe_deactivate(step)   # Deactivates at step 15
+
+# View profile: tensorboard --logdir=/tmp/profiles
+```
+
+### Example 7: Data Pipeline with Grain
+
+```python
+from grain import python as grain
+from tunix.generate import tokenizer_adapter
+
+# Load tokenizer
+tokenizer = tokenizer_adapter.TokenizerAdapter.from_pretrained(
+    "google/gemma-2-2b"
+)
+
+# Create dataset
+data = [
+    {"text": "Hello, world!", "label": 0},
+    {"text": "How are you?", "label": 1},
+    # ... more examples
+]
+
+# Define transformations
+class Tokenize(grain.MapTransform):
+  def __init__(self, tokenizer):
+    self._tokenizer = tokenizer
+  
+  def map(self, element):
+    tokens = self._tokenizer.tokenize(element["text"])
+    return {
+        "input_tokens": tokens,
+        "label": element["label"],
+    }
+
+# Build data loader
+dataset = grain.MapDataset.source(data)
+dataloader = grain.DataLoader(
+    data_source=dataset,
+    sampler=grain.IndexSampler(
+        num_records=len(dataset),
+        num_epochs=3,
+        shuffle=True,
+        seed=42,
+    ),
+    operations=[
+        Tokenize(tokenizer),
+        grain.Batch(batch_size=32, drop_remainder=True),
+    ],
+)
+
+# Iterate
+for batch in dataloader:
+  print(batch["input_tokens"].shape)  # (32, seq_len)
+```
+
+### Example 8: Model Resharding
+
+```python
+from tunix.rl import reshard
+
+# Source: Model on learner mesh (8 devices, FSDP)
+learner_mesh = jax.sharding.Mesh(jax.devices()[:8], ("fsdp",))
+with learner_mesh:
+  # Train model
+  model = train(model)
+
+# Target: Model on inference mesh (32 devices, replicated)
+inference_mesh = jax.sharding.Mesh(jax.devices(), ("replica",))
+
+# Reshard model to inference mesh
+model = reshard.reshard_model_to_mesh(model, inference_mesh)
+
+# Now model can be used on inference mesh
+with inference_mesh:
+  predictions = model(inputs)
+```
+
+### Example 9: Custom Data Module
+
+```python
+# File: my_dataset.py
+from grain import python as grain
+import numpy as np
+
+def create_dataset(name: str = "default", split: str = "train"):
+  """Create custom dataset.
+  
+  Args:
+    name: Dataset variant name
+    split: Data split (train/eval)
+  
+  Returns:
+    Grain MapDataset
+  """
+  # Load your data
+  data = load_my_data(name, split)
+  
+  # Process into format expected by Tunix
+  processed = []
+  for item in data:
+    processed.append({
+        "prompt": [
+            {"role": "user", "content": item["question"]},
+        ],
+        "response": item["answer"],
+    })
+  
+  return grain.MapDataset.source(processed)
+
+# Usage in CLI:
+# --dataset_name my_dataset:create_dataset(name='v2', split='train')
+```
+
+### Example 10: Multi-Process Data Loading
+
+```python
+import jax
+from grain import python as grain
+
+# Initialize JAX distributed
+jax.distributed.initialize(...)
+
+# Create data loader with sharding
+dataloader = grain.DataLoader(
+    data_source=train_ds,
+    sampler=grain.IndexSampler(
+        num_records=len(train_ds),
+        num_epochs=3,
+        # Each process gets different shard
+        shard_options=grain.ShardByJaxProcess(),
+    ),
+    operations=[
+        Tokenize(tokenizer),
+        grain.Batch(batch_size=32, drop_remainder=True),
+    ],
+)
+
+# Each process iterates over its own shard
+for batch in dataloader:
+  # Process ID 0 gets examples 0, 4, 8, ...
+  # Process ID 1 gets examples 1, 5, 9, ...
+  # etc.
+  loss = train_step(model, batch)
+```
+
 ## Best Practices
+
+### 1. Sharding Strategy Selection
+
+**Choose FSDP for**:
+- Large models (7B+ parameters)
+- Memory-constrained scenarios
+- Single mesh axis suffices
+
+**Choose Tensor Parallelism for**:
+- Very large models (70B+ parameters)
+- When FSDP alone isn't enough
+- Combined with FSDP in 2D mesh
+
+**Choose Data Parallelism for**:
+- Small models (< 3B parameters)
+- Compute-bound workloads
+- When memory is not a concern
+
+**Example Configuration**:
+```python
+# Small model (2B): Data parallel
+mesh = jax.sharding.Mesh(devices, ("data",))
+# Replicate model, shard data
+
+# Medium model (7B): FSDP
+mesh = jax.sharding.Mesh(devices, ("fsdp",))
+# Shard model across all devices
+
+# Large model (70B): FSDP + TP
+mesh = jax.sharding.Mesh(
+    devices.reshape(16, 2),
+    ("fsdp", "tp")
+)
+# 16-way FSDP, 2-way tensor parallel
+```
+
+### 2. Checkpoint Best Practices
+
+**✅ DO**:
+- Set reasonable save intervals (3-5 minutes minimum)
+- Limit `max_to_keep` to avoid filling disk
+- Save custom metadata for reproducibility
+- Test restoration early in training
+- Use `force=True` for important milestones
+
+**❌ DON'T**:
+- Save every step (too expensive)
+- Keep unlimited checkpoints (disk space)
+- Skip testing checkpoint restoration
+- Forget to sync processes after save
+
+**Example**:
+```python
+# ✅ Good checkpoint configuration
+options = ocp.CheckpointManagerOptions(
+    save_decision_policy=ocp.checkpoint_managers.ContinuousCheckpointingPolicy(
+        minimum_interval_secs=300,  # 5 minutes
+    ),
+    max_to_keep=5,
+)
+
+# ✅ Save with metadata
+ckpt_mgr.save(
+    step=step,
+    model=model,
+    custom_metadata={
+        "train_loss": float(train_loss),
+        "eval_accuracy": float(eval_acc),
+        "learning_rate": float(lr),
+        "config": dataclasses.asdict(config),
+    },
+)
+
+# ✅ Test restoration early
+restored_step, metadata = ckpt_mgr.maybe_restore(model)
+assert restored_step > 0 or step == 0, "Checkpoint restoration failed!"
+```
+
+### 3. Metrics Logging Guidelines
+
+**Structure**:
+- Use meaningful prefixes (`training`, `evaluation`, `system`)
+- Consistent metric names across runs
+- Log at appropriate frequencies
+- Flush periodically to avoid data loss
+
+**What to Log**:
+- **Training**: loss, learning_rate, gradient_norm
+- **Evaluation**: loss, accuracy, perplexity
+- **System**: tflops_per_sec, hbm_usage, step_time
+
+**Example**:
+```python
+# ✅ Good logging structure
+logger.log("training", "loss", loss, Mode.TRAIN, step)
+logger.log("training", "learning_rate", lr, Mode.TRAIN, step)
+logger.log("training", "gradient_norm", grad_norm, Mode.TRAIN, step)
+
+if step % 100 == 0:
+  logger.log("evaluation", "loss", eval_loss, Mode.EVAL, step)
+  logger.log("evaluation", "accuracy", eval_acc, Mode.EVAL, step)
+  logger.log("system", "tflops_per_sec", tflops, Mode.TRAIN, step)
+
+# ❌ Avoid inconsistent naming
+logger.log("train", "training_loss", loss, Mode.TRAIN, step)  # Different prefix
+logger.log("training", "train_loss", loss, Mode.TRAIN, step)   # Different name
+```
+
+### 4. Multi-Host Training Tips
+
+**Initialization**:
+- Start coordinator first (one designated host)
+- Ensure all processes use same coordinator address
+- Verify `jax.device_count() == num_processes * devices_per_host`
+
+**Synchronization**:
+- Use barriers after collective operations
+- Only main process saves checkpoints
+- Sync before exiting training loop
+
+**Debugging**:
+- Log process ID with all messages
+- Test with 2 hosts before scaling to many
+- Monitor network bandwidth usage
+
+**Example**:
+```python
+# ✅ Good multi-host setup
+def main():
+  # Initialize
+  jax.distributed.initialize(
+      coordinator_address=f"{coordinator_host}:1234",
+      num_processes=jax.process_count(),
+      process_id=jax.process_index(),
+  )
+  
+  # Verify setup
+  if jax.process_index() == 0:
+    print(f"Initialized {jax.process_count()} processes")
+    print(f"Total devices: {jax.device_count()}")
+  
+  # Training loop
+  for step in range(num_steps):
+    # All processes train
+    loss = train_step(model, batch)
+    
+    # Main process saves
+    if jax.process_index() == 0 and step % 100 == 0:
+      ckpt_mgr.save(step, model)
+    
+    # Wait for save to complete
+    jax.experimental.multihost_utils.sync_global_devices("ckpt_done")
+  
+  # Final sync before exit
+  jax.experimental.multihost_utils.sync_global_devices("training_done")
+```
+
+### 5. Data Pipeline Optimization
+
+**Performance**:
+- Use `grain.DataLoader` for efficient iteration
+- Shard data across processes
+- Use `drop_remainder=True` for consistent batch sizes
+- Pre-tokenize large datasets
+
+**Memory**:
+- Filter before batching
+- Use streaming for large datasets
+- Limit cache size for shuffled datasets
+
+**Debugging**:
+- Start with small fraction of data
+- Test transformations on single example
+- Verify batch shapes before training
+
+**Example**:
+```python
+# ✅ Optimized data pipeline
+dataloader = grain.DataLoader(
+    data_source=dataset,
+    sampler=grain.IndexSampler(
+        num_records=len(dataset),
+        num_epochs=3,
+        shuffle=True,
+        seed=42,
+        shard_options=grain.ShardByJaxProcess(),  # Shard across processes
+    ),
+    operations=[
+        Tokenize(tokenizer),
+        FilterShort(min_length=10),           # Filter before batch
+        grain.Batch(batch_size=32, drop_remainder=True),  # Consistent sizes
+    ],
+)
+
+# ✅ Verify first batch
+first_batch = next(iter(dataloader))
+print(f"Batch shape: {first_batch['input_tokens'].shape}")
+assert first_batch['input_tokens'].shape[0] == 32
+```
+
+### 6. Memory Management
+
+**Monitor HBM Usage**:
+```python
+# Show HBM at key points
+utils.show_hbm_usage("Before loading model")
+model = load_model()
+utils.show_hbm_usage("After loading model")
+
+# During training
+if step % 100 == 0:
+  utils.show_hbm_usage(f"Step {step}")
+```
+
+**Reduce Memory**:
+- Use FSDP for large models
+- Enable gradient checkpointing
+- Reduce batch size
+- Use mixed precision (bfloat16)
+
+**Detect Leaks**:
+```python
+# Track memory over time
+import gc
+
+for step in range(num_steps):
+  loss = train_step(model, batch)
+  
+  if step % 100 == 0:
+    gc.collect()  # Force GC
+    utils.show_hbm_usage(f"Step {step}")
+    # Memory should be stable
+```
+
+### 7. Profiling Strategy
+
+**When to Profile**:
+- After major code changes
+- When investigating performance issues
+- Before scaling to many hosts
+
+**What to Profile**:
+- Skip warmup steps (10-20)
+- Profile 3-5 representative steps
+- Capture both host and device traces
+
+**Analysis**:
+- Look for unexpected HBM usage
+- Identify communication bottlenecks
+- Check for inefficient ops
+
+**Example**:
+```python
+# ✅ Good profiling setup
+profiler_opts = profiler.ProfilerOptions(
+    log_dir="/tmp/profiles",
+    skip_first_n_steps=20,     # Skip warmup
+    profiler_steps=5,          # Profile 5 steps
+    host_tracer_level=2,       # Full traces
+)
+
+prof = profiler.Profiler(0, 1000, profiler_opts)
+
+for step in range(1000):
+  prof.maybe_activate(step)
+  loss = train_step(model, batch)
+  prof.maybe_deactivate(step)
+
+# Analyze: tensorboard --logdir=/tmp/profiles
+```
+
+### 8. Common Pitfalls
+
+**❌ Forgetting to shard input data**:
+```python
+# Wrong: Data not sharded
+for batch in dataloader:
+  loss = train_step(model, batch)  # May cause OOM
+
+# ✅ Right: Shard data
+for batch in dataloader:
+  batch = sharding_utils.shard_input(batch, ("fsdp",))
+  loss = train_step(model, batch)
+```
+
+**❌ Inconsistent mesh across processes**:
+```python
+# Wrong: Different mesh shapes per process
+if jax.process_index() == 0:
+  mesh = jax.sharding.Mesh(devices.reshape(8, 1), ("fsdp", "tp"))
+else:
+  mesh = jax.sharding.Mesh(devices.reshape(4, 2), ("fsdp", "tp"))
+
+# ✅ Right: Same mesh shape all processes
+mesh = jax.sharding.Mesh(
+    jax.devices().reshape(8, 1),  # All processes same shape
+    ("fsdp", "tp")
+)
+```
+
+**❌ Not waiting for checkpoint save**:
+```python
+# Wrong: Race condition
+if jax.process_index() == 0:
+  ckpt_mgr.save(step, model)
+# Non-main processes may try to load before save completes
+
+# ✅ Right: Synchronize
+if jax.process_index() == 0:
+  ckpt_mgr.save(step, model)
+jax.experimental.multihost_utils.sync_global_devices("ckpt_done")
+```
+
+**❌ Logging on all processes**:
+```python
+# Wrong: Duplicate logs from all processes
+for step in range(num_steps):
+  loss = train_step(model, batch)
+  print(f"Step {step}, Loss: {loss}")  # Printed 4x on 4 hosts
+
+# ✅ Right: Log only on main process
+if jax.process_index() == 0 and step % 10 == 0:
+  print(f"Step {step}, Loss: {loss}")
+```
